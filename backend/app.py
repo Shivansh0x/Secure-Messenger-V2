@@ -15,13 +15,11 @@ CORS(app, resources={r"/*": {"origins": [FRONTEND_URL]}})
 socketio = SocketIO(app, cors_allowed_origins=[FRONTEND_URL])
 
 # ────── Database: Postgres (Render) ──────
-# Expect DATABASE_URL to be a Postgres URL from Render.
 db_url = os.getenv('DATABASE_URL')
 if not db_url:
     # Local fallback (adjust if needed)
     db_url = 'postgresql://secure_messenger_user:11pPiMKd8uxISY174RHZ6dsd7BAwqCGo@dpg-d2fq0p8dl3ps73ehl020-a.singapore-postgres.render.com/secure_messenger'
 
-# Add sslmode=require ONLY for Postgres URLs (Render requires SSL)
 parsed = urlparse(db_url)
 scheme = (parsed.scheme or "").lower()
 if scheme.startswith("postgres") and "sslmode=" not in db_url:
@@ -64,8 +62,8 @@ class Message(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     sender = db.Column(db.String(64), nullable=False)
     recipient = db.Column(db.String(64), nullable=False)
-    message = db.Column(db.Text, nullable=False)        # AES payload (base64)
-    encrypted_key = db.Column(db.Text, nullable=False)  # Kyber-wrapped AES key (base64)
+    message = db.Column(db.Text, nullable=False)        
+    encrypted_key = db.Column(db.Text, nullable=False)  
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
 # ────── Routes ──────
@@ -130,8 +128,8 @@ def send_message():
         data = request.get_json(force=True)
         sender = data["sender"]
         recipient = data["recipient"]
-        aes_payload_b64 = data["message"]          # AES-GCM payload (base64)
-        encrypted_key_b64 = data["encrypted_key"]  # Kyber-wrapped AES key (base64)
+        aes_payload_b64 = data["message"]         
+        encrypted_key_b64 = data["encrypted_key"]  
 
         try:
             encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
