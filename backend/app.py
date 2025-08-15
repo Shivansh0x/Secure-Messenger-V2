@@ -10,8 +10,9 @@ from kyber_py.kyber import Kyber512
 
 # ────── App Init ──────
 app = Flask(__name__)
-CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://secure-messenger-v2.vercel.app")
+CORS(app, resources={r"/*": {"origins": [FRONTEND_URL]}})
+socketio = SocketIO(app, cors_allowed_origins=[FRONTEND_URL])
 
 # ────── Database: Postgres (Render) ──────
 # Expect DATABASE_URL to be a Postgres URL from Render.

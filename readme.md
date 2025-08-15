@@ -39,3 +39,6 @@ V1 used AES-256-GCM for messages and RSA for key exchange.
 cd backend
 pip install -r requirements.txt
 python app.py
+```
+
+Check it out at 
