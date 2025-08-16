@@ -12,30 +12,25 @@ function ChatSidebar({ username, onSelectUser, selectedUser, onlineUsers, contac
   const meLower = username?.toLowerCase() ?? "";
   const storageKey = `contacts:${meLower}`;
 
-  // Helper: upsert contact to top, dedupe, and never include self (memoized)
   const upsertContactTop = useCallback((name) => {
     if (!name) return;
     const lower = name.toLowerCase();
-    if (lower === meLower) return; // never add self
+    if (lower === meLower) return; 
     setContacts((prev) => {
       const next = [name, ...prev.filter((c) => c.toLowerCase() !== lower && c !== name)];
       return next;
     });
   }, [meLower, setContacts]);
 
-  // Hydrate contacts: merge backend + localStorage, dedupe, drop self
   useEffect(() => {
     (async () => {
       try {
-        // Load from server
         const { data } = await axios.get(`${API_BASE_URL}/contacts/${username}`);
         const serverList = Array.isArray(data) ? data : [];
 
-        // Load from localStorage (persisted across sessions)
         const localRaw = localStorage.getItem(storageKey);
         const localList = localRaw ? JSON.parse(localRaw) : [];
 
-        // Merge, dedupe (case-insensitive), filter out self
         const seen = new Set();
         const merged = [];
         for (const list of [serverList, localList]) {
@@ -52,22 +47,18 @@ function ChatSidebar({ username, onSelectUser, selectedUser, onlineUsers, contac
         setContacts(merged);
       } catch (e) {
         console.error("Failed to load contacts", e);
-        // If server fails, at least hydrate from local
         const localRaw = localStorage.getItem(storageKey);
         const localList = localRaw ? JSON.parse(localRaw) : [];
         const filtered = localList.filter((u) => (u || "").toLowerCase() !== meLower);
         setContacts(filtered);
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [username, storageKey, meLower, setContacts]);
 
-  // Persist contacts to localStorage whenever they change
   useEffect(() => {
     localStorage.setItem(storageKey, JSON.stringify(contacts));
   }, [contacts, storageKey]);
 
-  // Socket: react to new messages and upsert the other user to the top
   useEffect(() => {
     const socket = io(API_BASE_URL, { transports: ["websocket"], withCredentials: false });
     socketRef.current = socket;
@@ -85,7 +76,6 @@ function ChatSidebar({ username, onSelectUser, selectedUser, onlineUsers, contac
     return () => {
       socket.off("new_message");
     };
-    // include the memoized helper to satisfy exhaustive-deps
   }, [username, upsertContactTop]);
 
   const handleStartNewChat = async () => {
@@ -95,7 +85,7 @@ function ChatSidebar({ username, onSelectUser, selectedUser, onlineUsers, contac
     const cleaned = input.trim();
     const cleanedLower = cleaned.toLowerCase();
 
-    if (cleanedLower === meLower) return; // don't allow chatting with self
+    if (cleanedLower === meLower) return;
 
     const existing = contactsRef.current.find((u) => (u || "").toLowerCase() === cleanedLower);
     if (existing) {
@@ -145,7 +135,7 @@ function ChatSidebar({ username, onSelectUser, selectedUser, onlineUsers, contac
       {/* Contact List */}
       <div className="flex-1 overflow-y-auto p-4 space-y-2 text-white text-sm">
         {contacts
-          .filter((u) => (u || "").toLowerCase() !== meLower) // hard filter self in UI too
+          .filter((u) => (u || "").toLowerCase() !== meLower) 
           .map((user) => (
             <li
               key={user}
@@ -189,7 +179,6 @@ function ChatSidebar({ username, onSelectUser, selectedUser, onlineUsers, contac
         <LogoutButton
           onLogout={() => {
             localStorage.removeItem("username");
-            // Note: we do NOT clear contacts:<user> so contacts persist next login
             window.location.reload();
           }}
         />
