@@ -74,9 +74,7 @@ function App() {
   }, [contacts, username]);
 
   useEffect(() => {
-    if (Notification.permission !== "granted") {
       Notification.requestPermission();
-    }
   }, []);
 
   useEffect(() => {
