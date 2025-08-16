@@ -9,15 +9,27 @@ from flask_socketio import SocketIO, emit
 from kyber_py.kyber import Kyber512
 from dotenv import load_dotenv
 
-
-# ────── App Init ──────
 app = Flask(__name__)
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://secure-messenger-v2.vercel.app")
-CORS(app, resources={r"/*": {"origins": [FRONTEND_URL]}})
-socketio = SocketIO(app, cors_allowed_origins=[FRONTEND_URL])
+
+load_dotenv()  
+
+ALLOWED_ORIGINS = os.getenv(
+    "FRONTEND_ORIGINS",
+    "http://localhost:3000,https://secure-messenger-v2.vercel.app"
+).split(",")
+
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+    supports_credentials=False,
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+
+socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS)
 
 # ────── Database: Postgres (Render) ──────
-load_dotenv()
+
 db_url = os.getenv('DATABASE_URL')
 
 parsed = urlparse(db_url)

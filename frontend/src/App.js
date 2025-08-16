@@ -17,8 +17,6 @@ const saveStoredContacts = (username, contacts) => {
   localStorage.setItem(`contacts-${username}`, JSON.stringify(contacts));
 };
 
-const secretKey = "my-secret"; 
-
 function App() {
   const [username, setUsername] = useState(localStorage.getItem("username"));
   const [selectedUser, setSelectedUser] = useState(null);
@@ -33,7 +31,11 @@ function App() {
     if (cache.has(text)) return cache.get(text);
     let out;
     try {
-      const bytes = CryptoJS.AES.decrypt(text, secretKey);
+      const payload = JSON.parse(atob(text));
+      const { ciphertext, key, iv } = payload;
+      const keyWA = CryptoJS.enc.Base64.parse(key);
+      const ivWA  = CryptoJS.enc.Base64.parse(iv);
+      const bytes = CryptoJS.AES.decrypt(ciphertext, keyWA, { iv: ivWA });
       out = bytes.toString(CryptoJS.enc.Utf8);
       if (!out) out = "(decryption failed)";
     } catch {
