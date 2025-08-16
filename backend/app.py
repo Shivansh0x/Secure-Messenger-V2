@@ -7,6 +7,8 @@ from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, emit
 from kyber_py.kyber import Kyber512
+from dotenv import load_dotenv
+
 
 # ────── App Init ──────
 app = Flask(__name__)
@@ -15,10 +17,8 @@ CORS(app, resources={r"/*": {"origins": [FRONTEND_URL]}})
 socketio = SocketIO(app, cors_allowed_origins=[FRONTEND_URL])
 
 # ────── Database: Postgres (Render) ──────
+load_dotenv()
 db_url = os.getenv('DATABASE_URL')
-if not db_url:
-    # Local fallback (adjust if needed)
-    db_url = 'postgresql://secure_messenger_user:11pPiMKd8uxISY174RHZ6dsd7BAwqCGo@dpg-d2fq0p8dl3ps73ehl020-a.singapore-postgres.render.com/secure_messenger'
 
 parsed = urlparse(db_url)
 scheme = (parsed.scheme or "").lower()
