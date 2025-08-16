@@ -1,29 +1,89 @@
-import React, { useEffect, useState, useRef, useCallback } from "react";
+import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import axios from "axios";
 import CryptoJS from "crypto-js";
+import { io } from "socket.io-client";
 import { API_BASE_URL } from "../config";
-import { encryptWithAES, decryptWithAES } from "../utils/encryption";
+import { encryptWithAES } from "../utils/encryption";
+
+const decapBatch = async (decapUsername, encryptedKeys, API_BASE_URL) => {
+  const { data } = await axios.post(
+    `${API_BASE_URL}/decapsulate-batch`,
+    { username: decapUsername, encrypted_keys: encryptedKeys },
+    { timeout: 8000 }
+  );
+  return data?.results || {};
+};
+
+const axiosPostWithTimeout = (url, data, timeoutMs = 6000) =>
+  axios.post(url, data, { timeout: timeoutMs });
 
 function ChatWindow({ username, recipient }) {
   const [messages, setMessages] = useState([]);
   const [pending, setPending] = useState([]);
   const [newMessage, setNewMessage] = useState("");
+
   const chatEndRef = useRef(null);
+  const socketRef = useRef(null);
+
+  const pendingRef = useRef(pending);
+  useEffect(() => { pendingRef.current = pending; }, [pending]);
+
+  const keyCacheRef = useRef(new Map());
   const decryptCacheRef = useRef(new Map());
 
-  const decrypt = (text) => {
-    const cache = decryptCacheRef.current;
-    if (cache.has(text)) return cache.get(text);
+  const inflightPayloadsRef = useRef(new Set());
+  const lastSendTsRef = useRef(0);
+
+  const [plainByKey, setPlainByKey] = useState(() => new Map());
+  const plainByKeyRef = useRef(plainByKey);
+  useEffect(() => { plainByKeyRef.current = plainByKey; }, [plainByKey]);
+
+  const keyFor = (m) =>
+    m.id != null ? `id:${m.id}` : (m.client_ts != null ? `local:${m.client_ts}` : `msg:${m.message}`);
+
+  const decrypt = async (text, encryptedKeyB64, decapUsername) => {
+    const pCache = decryptCacheRef.current;
+    if (pCache.has(text)) return pCache.get(text);
+
     let out;
     try {
-      const parsed = JSON.parse(atob(text));
-      const sharedKey = CryptoJS.enc.Base64.parse(parsed.key);
-      const decrypted = decryptWithAES(parsed.ciphertext, sharedKey, parsed.iv);
-      out = decrypted || "(decryption failed)";
+      const payload = JSON.parse(atob(text));
+      const { ciphertext, iv, key } = payload;
+
+      let sharedKeyB64 = key; 
+
+      if (!sharedKeyB64) {
+        if (!encryptedKeyB64) throw new Error("Missing wrapped key for Kyber decapsulation");
+        const kCache = keyCacheRef.current;
+        if (kCache.has(encryptedKeyB64)) {
+          sharedKeyB64 = kCache.get(encryptedKeyB64);
+        } else {
+          const res = await axiosPostWithTimeout(`${API_BASE_URL}/decapsulate`, {
+            username: decapUsername,
+            encrypted_key: encryptedKeyB64,
+          }, 6000);
+          sharedKeyB64 = res.data.shared_key;
+          kCache.set(encryptedKeyB64, sharedKeyB64);
+        }
+      }
+
+      const keyWA = CryptoJS.enc.Base64.parse(sharedKeyB64);
+      const ivWA = CryptoJS.enc.Base64.parse(iv);
+      const cipherParams = CryptoJS.lib.CipherParams.create({
+        ciphertext: CryptoJS.enc.Base64.parse(ciphertext),
+      });
+      const bytes = CryptoJS.AES.decrypt(cipherParams, keyWA, {
+        iv: ivWA,
+        mode: CryptoJS.mode.CBC,
+        padding: CryptoJS.pad.Pkcs7,
+      });
+      out = bytes.toString(CryptoJS.enc.Utf8);
+      if (!out) out = "(decryption failed)";
     } catch {
       out = "(decryption failed)";
     }
-    cache.set(text, out);
+
+    pCache.set(text, out);
     return out;
   };
 
@@ -51,70 +111,206 @@ function ChatWindow({ username, recipient }) {
   }, [username, recipient]);
 
   useEffect(() => {
-    fetchMessages();
-    const id = setInterval(fetchMessages, 3000);
-    return () => clearInterval(id);
+    fetchMessages(); 
   }, [fetchMessages]);
 
-  const combined = [...messages, ...pending];
+  useEffect(() => {
+    const socket = io(API_BASE_URL, { transports: ["websocket"], withCredentials: false });
+    socketRef.current = socket;
+
+    socket.on("connect", () => {
+      socket.emit("user_connected", { username });
+    });
+
+    socket.on("new_message", (m) => {
+      const isThreadMsg =
+        (m.sender === username && m.recipient === recipient) ||
+        (m.sender === recipient && m.recipient === username);
+      if (!isThreadMsg) return;
+
+      if (!m.encrypted_key) {
+        const match = pendingRef.current.find((p) => p.message === m.message);
+        if (match?.encrypted_key) m = { ...m, encrypted_key: match.encrypted_key };
+      }
+
+      setMessages((prev) => {
+        if (prev.some((x) => x.id === m.id || x.message === m.message)) return prev;
+        return [...prev, m];
+      });
+
+      setPending((old) => old.filter((p) => p.message !== m.message));
+      inflightPayloadsRef.current.delete(m.message);
+    });
+
+    return () => {
+      socket.off("new_message");
+    };
+  }, [username, recipient]);
+
+  const getDisplayTime = (m) => {
+    if (m?.timestamp) return new Date(m.timestamp).getTime();
+    if (m?.client_ts) return m.client_ts;
+    return 0;
+  };
+
+  const combined = useMemo(() => {
+    const arr = [...messages, ...pending];
+    arr.sort((a, b) => {
+      const at = getDisplayTime(a);
+      const bt = getDisplayTime(b);
+      if (at !== bt) return at - bt;
+      const aIsPending = a.id == null;
+      const bIsPending = b.id == null;
+      if (aIsPending !== bIsPending) return aIsPending ? 1 : -1;
+      return 0;
+    });
+    return arr;
+  }, [messages, pending]);
+
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      const toDo = [];
+      for (const m of combined) {
+        const k = keyFor(m);
+        if (!plainByKeyRef.current.has(k)) toDo.push([k, m]);
+      }
+      if (!toDo.length) return;
+
+      const kCache = keyCacheRef.current;
+      const byUser = new Map(); 
+      for (const [, m] of toDo) {
+        const ek = m.encrypted_key || null;
+        if (!ek) continue;
+        if (kCache.has(ek)) continue;
+        const u = m.recipient;
+        if (!byUser.has(u)) byUser.set(u, new Set());
+        byUser.get(u).add(ek);
+      }
+      for (const [u, setKeys] of byUser) {
+        const list = Array.from(setKeys);
+        try {
+          const results = await decapBatch(u, list, API_BASE_URL);
+          for (const ek of list) {
+            const r = results[ek];
+            if (r && r.shared_key) {
+              kCache.set(ek, r.shared_key);
+            }
+          }
+        } catch {
+        }
+      }
+
+      const results = await Promise.all(
+        toDo.map(async ([k, m]) => {
+          const plain = await decrypt(m.message, m.encrypted_key || null, m.recipient);
+          return [k, plain];
+        })
+      );
+
+      if (!cancelled && results.length) {
+        setPlainByKey((prev) => {
+          const next = new Map(prev);
+          for (const [k, v] of results) next.set(k, v);
+          return next;
+        });
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [combined, username]); 
+
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [combined.length]);
 
   const sendMessage = async () => {
-    if (!newMessage.trim()) return;
+    const now = Date.now();
+    if (now - lastSendTsRef.current < 300) return;
+    lastSendTsRef.current = now;
+
+    const text = newMessage.trim();
+    if (!text) return;
+
+    setNewMessage("");
+
+    let encodedPayload;
 
     try {
-      await axios.post(`${API_BASE_URL}/ensure-keys`, {
-        usernames: [username, recipient],
-      });
+      await axios.post(`${API_BASE_URL}/ensure-keys`, { usernames: [username, recipient] });
 
-      const encKeyRes = await axios.post(`${API_BASE_URL}/encrypt-key`, {
-        username: recipient,
-      });
+      const encKeyRes = await axios.post(`${API_BASE_URL}/encrypt-key`, { username: recipient });
+      const encryptedKeyB64 = encKeyRes.data.encrypted_key;
+      const sharedKeyWords = CryptoJS.enc.Base64.parse(encKeyRes.data.shared_key);
 
-      const encryptedKeyB64 = encKeyRes.data.encrypted_key;                
-      const sharedKeyWords = CryptoJS.enc.Base64.parse(encKeyRes.data.shared_key); 
+      const { ciphertext, iv } = encryptWithAES(text, sharedKeyWords);
+      const payload = { ciphertext, iv };
+      encodedPayload = btoa(JSON.stringify(payload));
 
-      const { ciphertext, iv } = encryptWithAES(newMessage, sharedKeyWords);
-
-      const payload = { ciphertext, iv, key: encKeyRes.data.shared_key };
-      const encodedPayload = btoa(JSON.stringify(payload));
+      if (inflightPayloadsRef.current.has(encodedPayload)) {
+        return;
+      }
+      inflightPayloadsRef.current.add(encodedPayload);
 
       const localMsg = {
         sender: username,
         recipient,
         message: encodedPayload,
-        timestamp: new Date().toISOString(),
+        timestamp: null,
+        client_ts: Date.now(),
+        encrypted_key: encryptedKeyB64,
       };
-      decryptCacheRef.current.set(encodedPayload, newMessage);
+      decryptCacheRef.current.set(encodedPayload, text);
       setPending((prev) => [...prev, localMsg]);
-      setNewMessage("");
-
-      console.log("encrypted_key b64 length:", encryptedKeyB64.length);
-      console.log("shared_key  b64 length:", encKeyRes.data.shared_key.length);
 
       await axios.post(`${API_BASE_URL}/send`, {
         sender: username,
         recipient,
         message: encodedPayload,
-        encrypted_key: encryptedKeyB64, 
+        encrypted_key: encryptedKeyB64,
       });
+
+      setTimeout(() => {
+        inflightPayloadsRef.current.delete(encodedPayload);
+      }, 5000);
     } catch (err) {
-      console.error("Send failed:", err);
+      console.error("Send failed:", err?.response?.data || err.message || err);
+      if (encodedPayload) {
+        setPending((prev) => prev.filter((p) => p.message !== encodedPayload));
+        inflightPayloadsRef.current.delete(encodedPayload);
+      }
+    }
+  };
+
+  const onKeyDown = (e) => {
+    if (e.key === "Enter") {
+      if (e.repeat) return;
+      e.preventDefault();
+      sendMessage();
     }
   };
 
   return (
     <div className="h-full max-h-screen flex flex-col overflow-hidden">
       <div className="flex-1 overflow-y-auto p-4 space-y-2 bg-black">
-        {combined.map((msg, idx) => {
+        {combined.map((msg) => {
+          const k = keyFor(msg);
           const isMine = msg.sender === username;
+          const plain = plainByKey.get(k) ?? "Decrypting…";
+
+          const ts = msg.timestamp
+            ? msg.timestamp
+            : (msg.client_ts ? new Date(msg.client_ts).toISOString() : new Date().toISOString());
+
           return (
-            <div key={`${msg.message}-${idx}`} className={`flex ${isMine ? "justify-end" : "justify-start"}`}>
+            <div key={k} className={`flex ${isMine ? "justify-end" : "justify-start"}`}>
               <div className={`max-w-xs px-4 py-2 rounded-lg ${isMine ? "bg-blue-600 text-white" : "bg-gray-700 text-gray-100"}`}>
-                <div className="text-sm">{decrypt(msg.message)}</div>
-                <div className="text-xs text-gray-300 mt-1 text-right">{formatTimestamp(msg.timestamp)}</div>
+                <div className="text-sm break-words">{plain}</div>
+                <div className="text-xs text-gray-300 mt-1 text-right">
+                  {formatTimestamp(ts)}
+                </div>
               </div>
             </div>
           );
@@ -130,9 +326,13 @@ function ChatWindow({ username, recipient }) {
             placeholder="Type your message..."
             value={newMessage}
             onChange={(e) => setNewMessage(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+            onKeyDown={onKeyDown}
           />
-          <button onClick={sendMessage} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-r-lg">
+          <button
+            onClick={sendMessage}
+            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-r-lg"
+            disabled={!newMessage.trim()}
+          >
             Send
           </button>
         </div>

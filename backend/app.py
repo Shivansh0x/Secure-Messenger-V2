@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from kyber_py.kyber import Kyber512
 from dotenv import load_dotenv
 
@@ -49,9 +49,38 @@ def ensure_keypair(username: str):
     """Create and cache a Kyber keypair for username if missing."""
     if not username:
         return
+    
+    if username in user_keys and user_keys[username].get("public_key") and user_keys[username].get("private_key"):
+        rec = UserKey.query.filter_by(username=username).first()
+        if not rec:
+            pk_b64 = base64.b64encode(user_keys[username]["public_key"]).decode()
+            sk_b64 = base64.b64encode(user_keys[username]["private_key"]).decode()
+            db.session.add(UserKey(username=username, public_key_b64=pk_b64, private_key_b64=sk_b64))
+            db.session.commit()
+        return
+    
+    rec = UserKey.query.filter_by(username=username).first()
+    if rec:
+        try:
+            pk = base64.b64decode(rec.public_key_b64)
+            sk = base64.b64decode(rec.private_key_b64)
+        except Exception:
+            pk, sk = Kyber512.keygen()
+            rec.public_key_b64 = base64.b64encode(pk).decode()
+            rec.private_key_b64 = base64.b64encode(sk).decode()
+            db.session.commit()
+        user_keys[username] = {"public_key": pk, "private_key": sk}
+        return
+
     if username not in user_keys or not user_keys[username].get("public_key") or not user_keys[username].get("private_key"):
         pk, sk = Kyber512.keygen()
         user_keys[username] = {"public_key": pk, "private_key": sk}
+        db.session.add(UserKey(
+        username=username,
+        public_key_b64=base64.b64encode(pk).decode(),
+        private_key_b64=base64.b64encode(sk).decode(),
+        ))
+        db.session.commit()
 
 def encaps_detect(pubkey: bytes):
     """Some builds return (ss, ct) or (ct, ss). Return (ciphertext, shared_secret)."""
@@ -69,6 +98,13 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(64), unique=True, nullable=False)
     password = db.Column(db.String(128), nullable=False)
+
+class UserKey(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    public_key_b64 = db.Column(db.Text, nullable=False)
+    private_key_b64 = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
 class Message(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -110,6 +146,45 @@ def ensure_keys():
     for u in usernames:
         ensure_keypair(u)
     return jsonify({"status": "ok", "ensured": usernames})
+
+@app.route("/decapsulate-batch", methods=["POST"])
+def decapsulate_batch():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+    enc_keys = data.get("encrypted_keys") or []
+
+    if not username or not isinstance(enc_keys, list) or not enc_keys:
+        return jsonify({"error": "username and encrypted_keys (list) required"}), 400
+
+    ensure_keypair(username)
+    sk = user_keys[username]["private_key"]
+    pk = user_keys[username]["public_key"]
+
+    try:
+        expected_len = expected_ct_len_for(pk)
+    except Exception as e:
+        return jsonify({"error": f"could not compute expected ct length: {e}"}), 500
+
+    out = {}
+    for ek in enc_keys:
+        try:
+            ct = base64.b64decode(ek)
+        except Exception:
+            out[ek] = {"error": "invalid_base64"}
+            continue
+
+        if len(ct) != expected_len:
+            out[ek] = {"error": "invalid_ciphertext_length", "expected_bytes": expected_len, "got_bytes": len(ct)}
+            continue
+
+        try:
+            ss = Kyber512.decaps(sk, ct)
+            out[ek] = {"shared_key": base64.b64encode(ss).decode()}
+        except Exception as e:
+            out[ek] = {"error": f"decapsulation_failed: {e}"}
+
+    return jsonify({"results": out}), 200
+
 
 @app.route("/key/<recipient>", methods=["GET"])
 def get_public_key(recipient):
@@ -167,6 +242,16 @@ def send_message():
         )
         db.session.add(new_msg)
         db.session.commit()
+        msg_json = {
+        "id": new_msg.id,
+        "sender": new_msg.sender,
+        "recipient": new_msg.recipient,
+        "message": new_msg.message,
+        "encrypted_key": new_msg.encrypted_key,
+        "timestamp": new_msg.timestamp.isoformat() + "Z",
+        }
+        socketio.emit("new_message", msg_json, room=recipient)
+        socketio.emit("new_message", msg_json, room=sender)
         return jsonify({"status": "Message sent"}), 200
     except Exception as e:
         print("Exception in /send:", e)
@@ -180,12 +265,56 @@ def chat_between_users(user1, user2):
     ).order_by(Message.timestamp).all()
     return jsonify([
         {
+            "id": m.id,
             "sender": m.sender,
             "recipient": m.recipient,
             "message": m.message,
+            "encrypted_key": m.encrypted_key,
             "timestamp": m.timestamp.isoformat() + "Z"
         } for m in messages
     ])
+
+
+@app.route("/decapsulate", methods=["POST"])
+def decapsulate():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+    enc_key_b64 = data.get("encrypted_key")
+
+    if not username or not enc_key_b64:
+        return jsonify({"error": "username and encrypted_key required"}), 400
+
+    ensure_keypair(username)
+    sk = user_keys[username]["private_key"]
+    pk = user_keys[username]["public_key"]
+
+    try:
+        ct = base64.b64decode(enc_key_b64)
+    except Exception:
+        return jsonify({"error": "encrypted_key must be valid base64"}), 400
+
+    try:
+        expected_len = expected_ct_len_for(pk)  
+    except Exception as e:
+        return jsonify({"error": f"could not compute expected ct length: {e}"}), 500
+
+    if len(ct) != expected_len:
+        return jsonify({
+            "error": "invalid_ciphertext_length",
+            "details": {
+                "expected_bytes": expected_len,
+                "got_bytes": len(ct)
+            }
+        }), 422
+
+    try:
+        shared_secret = Kyber512.decaps(sk, ct)
+        shared_b64 = base64.b64encode(shared_secret).decode()
+        return jsonify({"shared_key": shared_b64}), 200
+    except Exception as e:
+        return jsonify({"error": f"decapsulation_failed: {e}"}), 422
+
+
 
 @app.route("/users/<username>", methods=["GET"])
 def check_user_exists(username):
@@ -201,10 +330,10 @@ def get_contacts(username):
     contacts = set()
     for msg in messages:
         if msg.sender == username:
-            contacts.add(msg.sender)
+            contacts.add(msg.recipient)   # <-- other party
         elif msg.recipient == username:
-            contacts.add(msg.recipient)
-    return jsonify(list(contacts))
+            contacts.add(msg.sender)      # <-- other party
+    return jsonify(sorted(list(contacts)))
 
 @app.route("/")
 def home():
@@ -220,6 +349,7 @@ def handle_user_connected(data):
     username = data.get("username")
     if username:
         online_users[username] = request.sid
+        join_room(username)
         emit("update_online_users", list(online_users.keys()), broadcast=True)
 
 @socketio.on("disconnect")
