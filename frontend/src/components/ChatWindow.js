@@ -4,6 +4,7 @@ import CryptoJS from "crypto-js";
 import { io } from "socket.io-client";
 import { API_BASE_URL } from "../config";
 import { encryptWithAES } from "../utils/encryption";
+import { loadSpamModel, spamScore } from "../ml/spam";
 
 const decapBatch = async (decapUsername, encryptedKeys, API_BASE_URL) => {
   const { data } = await axios.post(
@@ -40,7 +41,9 @@ function ChatWindow({ username, recipient }) {
   const socketRef = useRef(null);
 
   const pendingRef = useRef(pending);
-  useEffect(() => { pendingRef.current = pending; }, [pending]);
+  useEffect(() => {
+    pendingRef.current = pending;
+  }, [pending]);
 
   const keyCacheRef = useRef(new Map());
   const decryptCacheRef = useRef(new Map());
@@ -50,10 +53,20 @@ function ChatWindow({ username, recipient }) {
 
   const [plainByKey, setPlainByKey] = useState(() => new Map());
   const plainByKeyRef = useRef(plainByKey);
-  useEffect(() => { plainByKeyRef.current = plainByKey; }, [plainByKey]);
+  useEffect(() => {
+    plainByKeyRef.current = plainByKey;
+  }, [plainByKey]);
+
+  // ---- Spam model ready flag ----
+  const spamModelReadyRef = useRef(false);
+  useEffect(() => {
+    loadSpamModel()
+      .then(() => (spamModelReadyRef.current = true))
+      .catch(() => (spamModelReadyRef.current = false));
+  }, []);
 
   const keyFor = (m) =>
-    m.id != null ? `id:${m.id}` : (m.client_ts != null ? `local:${m.client_ts}` : `msg:${m.message}`);
+    m.id != null ? `id:${m.id}` : m.client_ts != null ? `local:${m.client_ts}` : `msg:${m.message}`;
 
   // --------- Decrypt helper (async) ---------
   const decrypt = async (text, encryptedKeyB64, decapUsername) => {
@@ -65,7 +78,7 @@ function ChatWindow({ username, recipient }) {
       const payload = JSON.parse(atob(text));
       const { ciphertext, iv, key } = payload;
 
-      let sharedKeyB64 = key; 
+      let sharedKeyB64 = key; // legacy payloads may carry raw key
 
       if (!sharedKeyB64) {
         if (!encryptedKeyB64) throw new Error("Missing wrapped key for Kyber decapsulation");
@@ -73,10 +86,14 @@ function ChatWindow({ username, recipient }) {
         if (kCache.has(encryptedKeyB64)) {
           sharedKeyB64 = kCache.get(encryptedKeyB64);
         } else {
-          const res = await axiosPostWithTimeout(`${API_BASE_URL}/decapsulate`, {
-            username: decapUsername,
-            encrypted_key: encryptedKeyB64,
-          }, 6000);
+          const res = await axiosPostWithTimeout(
+            `${API_BASE_URL}/decapsulate`,
+            {
+              username: decapUsername,
+              encrypted_key: encryptedKeyB64,
+            },
+            6000
+          );
           sharedKeyB64 = res.data.shared_key;
           kCache.set(encryptedKeyB64, sharedKeyB64);
         }
@@ -107,7 +124,8 @@ function ChatWindow({ username, recipient }) {
     const d = new Date(isoString);
     const now = new Date();
     const isToday = d.toDateString() === now.toDateString();
-    const y = new Date(now); y.setDate(now.getDate() - 1);
+    const y = new Date(now);
+    y.setDate(now.getDate() - 1);
     const isYesterday = d.toDateString() === y.toDateString();
     const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: true });
     if (isToday) return `Today at ${time}`;
@@ -159,6 +177,7 @@ function ChatWindow({ username, recipient }) {
       setPending((old) => old.filter((p) => p.message !== m.message));
       inflightPayloadsRef.current.delete(m.message);
 
+      // Notifications (best-effort decrypted preview)
       if (m.sender !== username && document.visibilityState === "hidden" && canNotify()) {
         let preview = "New message";
         try {
@@ -246,7 +265,9 @@ function ChatWindow({ username, recipient }) {
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [combined, username]);
 
   useEffect(() => {
@@ -255,11 +276,23 @@ function ChatWindow({ username, recipient }) {
 
   const sendMessage = async () => {
     const now = Date.now();
-    if (now - lastSendTsRef.current < 300) return;
+    if (now - lastSendTsRef.current < 300) return; // throttle taps
     lastSendTsRef.current = now;
 
     const text = newMessage.trim();
     if (!text) return;
+
+    // ---- Client-side spam check (E2E safe; plaintext stays local)
+    try {
+      if (spamModelReadyRef.current) {
+        const { prob } = spamScore(text);
+        if (prob >= 0.90) {
+          const proceed = window.confirm("This message looks like spam. Send anyway?");
+          if (!proceed) return; // abort send
+        }
+      }
+    } catch {}
+    // ----------------------------------------
 
     setNewMessage("");
 
@@ -327,16 +360,39 @@ function ChatWindow({ username, recipient }) {
           const isMine = msg.sender === username;
           const plain = plainByKey.get(k) ?? "Decrypting…";
 
+          // Optional: tag as suspected spam (UI only)
+          const spamTag = (() => {
+            try {
+              if (
+                spamModelReadyRef.current &&
+                plain &&
+                plain !== "Decrypting…" &&
+                plain !== "(decryption failed)"
+              ) {
+                const { prob } = spamScore(plain);
+                return prob >= 0.90;
+              }
+            } catch {}
+            return false;
+          })();
+
           const ts = msg.timestamp
             ? msg.timestamp
-            : (msg.client_ts ? new Date(msg.client_ts).toISOString() : new Date().toISOString());
+            : msg.client_ts
+            ? new Date(msg.client_ts).toISOString()
+            : new Date().toISOString();
 
           return (
             <div key={k} className={`flex ${isMine ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-xs px-4 py-2 rounded-lg ${isMine ? "bg-blue-600 text-white" : "bg-gray-700 text-gray-100"}`}>
+              <div
+                className={`max-w-xs px-4 py-2 rounded-lg ${
+                  isMine ? "bg-blue-600 text-white" : "bg-gray-700 text-gray-100"
+                }`}
+              >
                 <div className="text-sm break-words">{plain}</div>
-                <div className="text-xs text-gray-300 mt-1 text-right">
-                  {formatTimestamp(ts)}
+                <div className="text-xs text-gray-300 mt-1 flex justify-between gap-3">
+                  <span>{formatTimestamp(ts)}</span>
+                  {spamTag && <span className="text-red-400">suspected spam</span>}
                 </div>
               </div>
             </div>
