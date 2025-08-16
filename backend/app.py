@@ -1,6 +1,6 @@
 import os
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -64,7 +64,8 @@ class Message(db.Model):
     recipient = db.Column(db.String(64), nullable=False)
     message = db.Column(db.Text, nullable=False)        
     encrypted_key = db.Column(db.Text, nullable=False)  
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
 
 # ────── Routes ──────
 @app.route("/register", methods=["POST"])
@@ -187,9 +188,9 @@ def get_contacts(username):
     ).all()
     contacts = set()
     for msg in messages:
-        if msg.sender != username:
+        if msg.sender == username:
             contacts.add(msg.sender)
-        if msg.recipient != username:
+        elif msg.recipient == username:
             contacts.add(msg.recipient)
     return jsonify(list(contacts))
 
