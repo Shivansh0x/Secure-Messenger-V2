@@ -330,9 +330,9 @@ def get_contacts(username):
     contacts = set()
     for msg in messages:
         if msg.sender == username:
-            contacts.add(msg.recipient)   # <-- other party
+            contacts.add(msg.recipient)  
         elif msg.recipient == username:
-            contacts.add(msg.sender)      # <-- other party
+            contacts.add(msg.sender)      
     return jsonify(sorted(list(contacts)))
 
 @app.route("/")

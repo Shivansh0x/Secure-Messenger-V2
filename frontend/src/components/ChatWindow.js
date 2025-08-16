@@ -17,6 +17,20 @@ const decapBatch = async (decapUsername, encryptedKeys, API_BASE_URL) => {
 const axiosPostWithTimeout = (url, data, timeoutMs = 6000) =>
   axios.post(url, data, { timeout: timeoutMs });
 
+const canNotify = () =>
+  "Notification" in window && Notification.permission === "granted";
+
+const showNativeNotification = (title, body) => {
+  try {
+    new Notification(title, {
+      body,
+      tag: `${title}-${Date.now()}`,
+      renotify: false,
+      silent: false,
+    });
+  } catch {}
+};
+
 function ChatWindow({ username, recipient }) {
   const [messages, setMessages] = useState([]);
   const [pending, setPending] = useState([]);
@@ -41,6 +55,7 @@ function ChatWindow({ username, recipient }) {
   const keyFor = (m) =>
     m.id != null ? `id:${m.id}` : (m.client_ts != null ? `local:${m.client_ts}` : `msg:${m.message}`);
 
+  // --------- Decrypt helper (async) ---------
   const decrypt = async (text, encryptedKeyB64, decapUsername) => {
     const pCache = decryptCacheRef.current;
     if (pCache.has(text)) return pCache.get(text);
@@ -87,6 +102,7 @@ function ChatWindow({ username, recipient }) {
     return out;
   };
 
+  // --------- Formatting ---------
   const formatTimestamp = (isoString) => {
     const d = new Date(isoString);
     const now = new Date();
@@ -99,6 +115,7 @@ function ChatWindow({ username, recipient }) {
     return `${d.toLocaleDateString([], { month: "short", day: "numeric" })} at ${time}`;
   };
 
+  // --------- Fetch thread (initial hydrate only) ---------
   const fetchMessages = useCallback(async () => {
     try {
       const res = await axios.get(`${API_BASE_URL}/chat/${username}/${recipient}`);
@@ -111,9 +128,10 @@ function ChatWindow({ username, recipient }) {
   }, [username, recipient]);
 
   useEffect(() => {
-    fetchMessages(); 
+    fetchMessages();
   }, [fetchMessages]);
 
+  // --------- Socket.IO wiring ---------
   useEffect(() => {
     const socket = io(API_BASE_URL, { transports: ["websocket"], withCredentials: false });
     socketRef.current = socket;
@@ -122,7 +140,7 @@ function ChatWindow({ username, recipient }) {
       socket.emit("user_connected", { username });
     });
 
-    socket.on("new_message", (m) => {
+    socket.on("new_message", async (m) => {
       const isThreadMsg =
         (m.sender === username && m.recipient === recipient) ||
         (m.sender === recipient && m.recipient === username);
@@ -140,6 +158,15 @@ function ChatWindow({ username, recipient }) {
 
       setPending((old) => old.filter((p) => p.message !== m.message));
       inflightPayloadsRef.current.delete(m.message);
+
+      if (m.sender !== username && document.visibilityState === "hidden" && canNotify()) {
+        let preview = "New message";
+        try {
+          preview = await decrypt(m.message, m.encrypted_key || null, m.recipient);
+          if (!preview || preview === "(decryption failed)") preview = "New message";
+        } catch {}
+        showNativeNotification(m.sender, preview);
+      }
     });
 
     return () => {
@@ -167,7 +194,7 @@ function ChatWindow({ username, recipient }) {
     return arr;
   }, [messages, pending]);
 
-
+  // --------- Pre-decrypt messages (batched + concurrent) ---------
   useEffect(() => {
     let cancelled = false;
 
@@ -180,7 +207,7 @@ function ChatWindow({ username, recipient }) {
       if (!toDo.length) return;
 
       const kCache = keyCacheRef.current;
-      const byUser = new Map(); 
+      const byUser = new Map();
       for (const [, m] of toDo) {
         const ek = m.encrypted_key || null;
         if (!ek) continue;
@@ -189,6 +216,7 @@ function ChatWindow({ username, recipient }) {
         if (!byUser.has(u)) byUser.set(u, new Set());
         byUser.get(u).add(ek);
       }
+
       for (const [u, setKeys] of byUser) {
         const list = Array.from(setKeys);
         try {
@@ -199,8 +227,7 @@ function ChatWindow({ username, recipient }) {
               kCache.set(ek, r.shared_key);
             }
           }
-        } catch {
-        }
+        } catch {}
       }
 
       const results = await Promise.all(
@@ -220,7 +247,7 @@ function ChatWindow({ username, recipient }) {
     })();
 
     return () => { cancelled = true; };
-  }, [combined, username]); 
+  }, [combined, username]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
